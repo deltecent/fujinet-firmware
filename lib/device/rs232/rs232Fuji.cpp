@@ -5,6 +5,8 @@
 #include "fnSystem.h"
 #include "fnConfig.h"
 #include "fsFlash.h"
+#include "fnFsSD.h"
+#include "fnFileWriteNotify.h"
 #include "fnWiFi.h"
 #include "utils.h"
 #include "compat_string.h"
@@ -32,6 +34,10 @@ rs232Fuji::rs232Fuji() : fujiDevice(MAX_DISK_DEVICES, IMAGE_EXTENSION, LOBBY_URL
 void rs232Fuji::setup()
 {
     // set up Fuji device
+
+    // Reopen a mounted disk image when its file is overwritten by an upload/N:
+    // write, so the host stops reading stale contents.
+    set_local_file_written_cb(&rs232Fuji::on_local_file_written);
 
     populate_slots_from_config();
 
@@ -410,6 +416,67 @@ ByteBuffer rs232Fuji::appkey_read()
     const uint8_t *len_bytes = reinterpret_cast<const uint8_t*>(&len);
     result.insert(result.begin(), len_bytes, len_bytes + sizeof(len));
     return result;
+}
+
+// Normalize an SD path for comparison. Write paths always carry a leading '/'
+// and no host prefix; a mounted disk.filename carries the local host prefix and
+// has a leading '/' only when that prefix is non-empty. Force a leading '/' then
+// canonicalize so the two conventions compare equal.
+static std::string canonical_sd_path(const char *p)
+{
+    std::string s = (p != nullptr && *p == '/') ? std::string(p)
+                                                : std::string("/") + (p ? p : "");
+    return util_get_canonical_path(s);
+}
+
+// Trampoline for the C-style notifier callback -- forwards to the singleton.
+void rs232Fuji::on_local_file_written(const char *sd_path)
+{
+    platformFuji.reopen_slot_if_mounted(sd_path);
+}
+
+void rs232Fuji::reopen_slot_if_mounted(const char *sd_path)
+{
+    if (sd_path == nullptr || *sd_path == '\0')
+        return;
+
+    std::string want = canonical_sd_path(sd_path);
+
+    for (unsigned int i = 0; i < _totalDiskDevices; i++)
+    {
+        fujiDisk &disk = *get_disk(i);
+        if (disk.disk_type == MEDIATYPE_UNKNOWN || disk.fileh == nullptr)
+            continue; // slot not mounted
+
+        fujiHost &host = _fnHosts[disk.host_slot];
+        if (host.get_type() != HOSTTYPE_LOCAL)
+            continue; // remote host can't collide with a local SD write
+
+        if (strcasecmp(want.c_str(), canonical_sd_path(disk.filename).c_str()) != 0)
+            continue; // different file
+
+        // --- reopen this slot's handle in place ---
+        Debug_printf("RS232: reopening D%u: after overwrite of %s\r\n", i + 1, sd_path);
+        DISK_DEVICE *dev = get_disk_dev(i);
+
+        char mode[4] = {'r', 'b', 0, 0};
+        if (disk.access_mode & DISK_ACCESS_MODE_WRITE)
+            mode[2] = '+';
+
+        dev->unmount(); // fclose old _disk_fileh + delete MediaType
+
+        // disk.filename already holds the host-resolved (SD-root-relative) realpath,
+        // so reopen it straight through fnSDFAT -- do NOT re-run fujiHost::fnfile_open,
+        // which would prepend the host prefix a second time.
+        disk.fileh = fnSDFAT.fnfile_open(disk.filename, mode);
+        if (disk.fileh == nullptr)
+        {
+            disk.disk_type = MEDIATYPE_UNKNOWN; // leave slot cleanly unmounted on failure
+            continue;
+        }
+        disk.disk_size = host.file_size(disk.fileh);
+        disk.disk_type = mount_media(dev, disk, host, disk.access_mode);
+    }
 }
 
 #endif /* BUILD_RS232 */

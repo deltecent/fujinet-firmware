@@ -5,6 +5,7 @@
 #include "../../include/debug.h"
 #include "fnFsSD.h"
 #include "fnPassword.h"
+#include "fnFileWriteNotify.h"
 
 #define FM_MAX_PATH 255
 
@@ -326,6 +327,12 @@ void MultipartFileWriter::close_part()
     stored.name = _filename;
     stored.bytes = _part_written;
     _files.push_back(stored);
+
+    // If this file is mounted on a disk slot, reopen it so reads see the new
+    // contents instead of the stale cached handle (RS232 acts; others no-op).
+    std::string full;
+    if (FileManager::join(_dir, _filename, full))
+        notify_local_file_written(full.c_str());
 }
 
 /* Write everything in _pending that cannot be the start of a boundary. */

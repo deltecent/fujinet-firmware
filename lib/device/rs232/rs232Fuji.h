@@ -9,6 +9,12 @@
 class rs232Fuji : public fujiDevice
 {
 private:
+    // Handler registered with the decoupled local-file-write notifier (see
+    // set_local_file_written_cb in setup()). When an upload/N: write overwrites a
+    // file that a disk slot has mounted, reopen that slot's handle so reads see
+    // the new contents instead of the stale cached handle.
+    static void on_local_file_written(const char *sd_path);
+    void reopen_slot_if_mounted(const char *sd_path);
 
 protected:
     size_t set_additional_direntry_details(fsdir_entry_t *f, uint8_t *dest,

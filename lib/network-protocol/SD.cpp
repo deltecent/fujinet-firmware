@@ -13,6 +13,7 @@
 #include "fnFsSD.h"
 #include "status_error_codes.h"
 #include "compat_string.h"
+#include "fnFileWriteNotify.h"
 
 #include <vector>
 
@@ -189,6 +190,11 @@ fujiError_t NetworkProtocolSD::close_file_handle()
     {
         ::fclose(fh);
         fh = nullptr;
+
+        // If a write just landed on a file mounted on a disk slot, reopen it so
+        // reads see the new contents (RS232 acts; other platforms no-op).
+        if (was_write && opened_url != nullptr)
+            notify_local_file_written(opened_url->path.c_str());
     }
     error = NDEV_STATUS::SUCCESS;
     return FUJI_ERROR::NONE;
