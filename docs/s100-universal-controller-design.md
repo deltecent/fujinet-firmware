@@ -271,6 +271,31 @@ S100 bus carries two separate 8-bit data buses — DI0–DI7 (to the CPU) and DO
 past 32 GPIO into the RP2350's upper bank — which is exactly why the PIO-bank rules
 in the callout above bind here and did not for MSX.
 
+The two routing options below are parallel — the same address, status, and control
+assignments, differing only in how the data buses reach the RP2350. Option A wires
+all sixteen data lines directly; [Option B](#option-b--one-bidirectional-data-bus-via-a-transceiver)
+merges them through a transceiver to free GPIO.
+
+Two design consequences follow directly from the guide and hold for **both**
+options:
+
+- **Transport should be USB-CDC, not UART, for the pin budget.** USB-CDC uses the
+  RP2350's dedicated USB pins, leaving all 48 GPIO for the bus; a UART backend
+  would consume two GPIO. This reinforces the roadmap's step-0 preference
+  ([§15](#15-implementation-roadmap)) and [risk 7](#14-open-questions-and-risks).
+  It matters most to Option A, which has almost no GPIO slack.
+- **The three PIO-bank rules are load-bearing** (callout above; guide Ch. 9
+  `setup_state_machine()`): the build must define `PICO_PIO_USE_GPIO_BASE=1`
+  because the driven, DMA, interrupt and reset lines all live above `GP31`; no
+  state machine's contiguous pin span may cross the 16↔32 boundary; and the
+  single-instruction autopush that captures the decode word reaches only the low
+  32 GPIO. Both options honor these — they differ only in how the *data* lines are
+  placed. Option A splits the driven DI (upper bank) from the sampled DO (low
+  bank), which is *why* it puts DO low and DI high; Option B keeps a single
+  bidirectional data block low on `GP24–GP31`, a simpler bank story.
+
+#### Option A — direct wiring (16 data GPIO)
+
 Applying the guide's method to the S100 signal set (§3, §7, §8.4) yields the
 **starting** assignment below — a routing proposal to settle before the adapter is
 laid out, not a committed pinout. It deliberately packs everything the *decode*
@@ -308,24 +333,9 @@ per-bit pins are listed in bit order, not as a range:
 
 That is **44 assigned signals of the RP2350B's 48 GPIO** — S100 genuinely needs
 the high-pin-count part ([§3](#3-two-mcu-architecture)), and the map has almost no
-slack. Call this **Option A (direct wiring)**: all 16 data lines are their own
-GPIO. A **secondary option that trades a transceiver for seven freed GPIO** is
-[below](#option-b--one-bidirectional-data-bus-via-a-transceiver). Two consequences
-follow directly from the guide:
-
-- **Transport should be USB-CDC, not UART, for the pin budget.** USB-CDC uses the
-  RP2350's dedicated USB pins, leaving all 48 GPIO for the bus; a UART backend
-  would consume two GPIO and force dropping the two low-bank spares (or a status
-  line). This reinforces the roadmap's step-0 preference ([§15](#15-implementation-roadmap))
-  and [risk 7](#14-open-questions-and-risks).
-- **The three PIO-bank rules are load-bearing here** (callout above; guide Ch. 9
-  `setup_state_machine()`): the build must define `PICO_PIO_USE_GPIO_BASE=1` (DI,
-  /PRDY, interrupt, DMA and STA DSB all live above `GP31`); no state machine's
-  contiguous pin span may cross the 16↔32 boundary (address + decode + DO fit
-  entirely in the low bank; DI0–DI7 sit entirely in the upper bank at base 32);
-  and the single-instruction autopush that captures the decode word reaches only
-  the low 32 GPIO — which is *why* DO (sampled) is placed low and DI (driven) is
-  placed high.
+slack — all 16 data lines are their own GPIO. A **secondary option that trades a
+transceiver for seven freed GPIO** is
+[Option B below](#option-b--one-bidirectional-data-bus-via-a-transceiver).
 
 The decode word is the S100 analog of the guide's `BusSignals` union (Ch. 8.3,
 9.1) — the union's bitfields **are** the GPIO map:
