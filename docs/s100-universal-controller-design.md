@@ -107,7 +107,8 @@ parallel bus needs the high-pin-count part. S100 is exactly that — a universal
 controller must see A0–A15 (16 lines, for North Star's memory-mapped registers and
 boot-ROM windows), the **separate** DI0–DI7 and DO0–DO7 data buses (16 more), plus
 `sINP`/`sOUT`/`pDBIN`/`pWR*`/`/PRDY`/status/VI interrupt/`PHOLD`/`PHLDA` control —
-comfortably 40+ GPIO. An RP2040 (~30 usable GPIO, 2 PIO blocks / 8 state machines)
+comfortably 40+ GPIO (a concrete starting map is
+[§7.1](#71-a-possible-gpio--s100-signal-map)). An RP2040 (~30 usable GPIO, 2 PIO blocks / 8 state machines)
 cannot fit that; the **RP2350B** (up to 48 GPIO, 3 PIO blocks / 12 state machines)
 is the intended part, and — per the guide — it also interfaces to 5 V bus levels
 directly (see [§14](#14-open-questions-and-risks) risk 3 for the backplane-drive
@@ -253,6 +254,107 @@ Pico PIO + tight core-1 code.
 > decode must sample address, DI and DO across **multiple** PIO reads or state
 > machines rather than one packed word. Plan the GPIO map around these before
 > laying out the adapter. See also [§14](#14-open-questions-and-risks) risk 8.
+
+### 7.1 A possible GPIO → S100 signal map
+
+The Platform Bring-Up Guide teaches the pin map as a **routing decision, not a
+fixed pinout**: its *default GPIO routing* (FEP-004 Ch. 4, Table 7) assigns each
+RP2350 GPIO to an ISA-role signal, and every worked example then keeps what fits
+and repurposes the rest. **MSX fit almost untouched** (Ch. 5, Table 9): 16 address
+lines landed on `GP0–GP15`, the single 8-bit data bus on `GP20–GP27`, and the four
+default "strobe" pins `GP28–GP31` were merely *reinterpreted* in the PIO as the
+Z80's `/RD` / `/WR` / `/IORQ` / `/MERQ` — "nothing cut or patched." S100 does
+**not** fit that cleanly, for a specific and instructive reason: **the classic
+S100 bus carries two separate 8-bit data buses — DI0–DI7 (to the CPU) and DO0–DO7
+(from the CPU) — not one.** That alone breaks the default single-`D0–D7`-on-
+`GP20–GP27` assignment, and together with the wider control set it pushes the map
+past 32 GPIO into the RP2350's upper bank — which is exactly why the PIO-bank rules
+in the callout above bind here and did not for MSX.
+
+Applying the guide's method to the S100 signal set (§3, §7, §8.4) yields the
+**starting** assignment below — a routing proposal to settle before the adapter is
+laid out, not a committed pinout. It deliberately packs everything the *decode*
+state machine must sample into the **low 32 GPIO** (so one `in pins, 32` autopush
+grabs address + cycle-decode + write-data in a single word, like the guide's
+`send_bus` SM, Ch. 8–9) and puts the **driven** lines and the DMA/interrupt
+handshake in the upper bank:
+
+The **S100 pin** column is the physical bus-connector pin from the MITS 880-110
+bus definition [Altair8800]. Note that the 100-line bus **does not order the
+address and data lines sequentially** on the connector — A0–A15 and the two data
+buses are scattered across both 50-pin rows (top = 1–50, bottom = 51–100) — so the
+per-bit pins are listed in bit order, not as a range:
+
+| S100 signal | S100 pin(s) | RP2350 GPIO | Bank | Dir | Role / note |
+|---|---|---|---|---|---|
+| A0–A15 | A0–A7: 79 80 81 31 30 29 82 83 · A8–A15: 84 34 37 87 33 85 86 32 | `GP0–GP15` | low | in | Address. I/O decode uses A0–A7; **memory** decode (North Star E800h, boot-ROM windows [§8.4](#84-boot-rom--prom-provisioning)) uses all 16. Same placement as the guide's default/MSX. |
+| pSYNC | 76 | `GP16` | low | in | Cycle start — the status byte is valid at pSYNC (SYNC·Φ1). |
+| pDBIN | 78 | `GP17` | low | in | Read data strobe (drive DI while asserted). |
+| pWR* | 77 | `GP18` | low | in | Write data strobe (latch DO). Active low. |
+| sINP | 46 | `GP19` | low | in | Status: I/O input cycle. |
+| sOUT | 45 | `GP20` | low | in | Status: I/O output cycle. |
+| sMEMR | 47 | `GP21` | low | in | Status: memory read (North Star / boot ROM). |
+| *(spare)* | sWO* 97 / sM1 44 | `GP22–GP23` | low | — | In-bank spare — e.g. sWO* (write-cycle) / sM1 (opcode fetch) if a personality needs more status for bus-takeover ([§8.4](#84-boot-rom--prom-provisioning)). |
+| DO0–DO7 | 36 35 88 89 38 39 40 90 | `GP24–GP31` | low | in | **Host write data** (data-out bus, from the CPU). Placed low so it is captured in the *same* autopush word as the decode above. |
+| DI0–DI7 | 95 94 41 42 91 92 93 43 | `GP32–GP39` | upper | out | **Board read data** (data-in bus, to the CPU). Driven by a separate SM wholly inside one bank; does not straddle 16↔32. Honor `bus_inverted` ([§8.1](#81-the-generic-wd179x--fd1771-core)). |
+| /PRDY | 72 | `GP40` | upper | out | Wait line for the PRDY / WAIT-port stall models ([§7](#7-s100-bus-interface-layer-pio) table). (XRDY pin 3 is the alternate; pick per backplane.) |
+| PINT (/INT) | 73 | `GP41` | upper | out | Interrupt request (active low). Expand to VI0–VI7 vectored lines (pins 4–11) on the spares if a personality needs them. |
+| PHOLD | 74 | `GP42` | upper | out | DMA bus-request (active low) — become S100 temporary bus master for the CompuPro DMA model ([§5](#5-the-reality-of-universal), [§7](#7-s100-bus-interface-layer-pio)). |
+| PHLDA | 26 | `GP43` | upper | in | DMA bus-grant (host acknowledges the hold; buses go high-Z). |
+| STA DSB | 18 | `GP44` | upper | out | Status-disable (active low) for the ROM/RAM-shadow **bus takeover** (Tarbell, [§8.4](#84-boot-rom--prom-provisioning)). |
+| PRESET* / POC* | 75 / 99 | `GP45` | upper | in | Bus reset (both active low) — reset the emulated chip / re-arm the boot PROM ([§7](#7-s100-bus-interface-layer-pio)). |
+| Φ2 | 24 | `GP46` | upper | in | Bus clock — timing reference for the strobe windows. (Φ1 pin 25 and CLOCK pin 49 are the other clock lines.) |
+| *(spare)* | — | `GP47` | upper | — | Upper-bank spare (extra VI line, or the XRDY pin-3 wait line). |
+
+That is **44 assigned signals of the RP2350B's 48 GPIO** — S100 genuinely needs
+the high-pin-count part ([§3](#3-two-mcu-architecture)), and the map has almost no
+slack. Two consequences follow directly from the guide:
+
+- **Transport should be USB-CDC, not UART, for the pin budget.** USB-CDC uses the
+  RP2350's dedicated USB pins, leaving all 48 GPIO for the bus; a UART backend
+  would consume two GPIO and force dropping the two low-bank spares (or a status
+  line). This reinforces the roadmap's step-0 preference ([§15](#15-implementation-roadmap))
+  and [risk 7](#14-open-questions-and-risks).
+- **The three PIO-bank rules are load-bearing here** (callout above; guide Ch. 9
+  `setup_state_machine()`): the build must define `PICO_PIO_USE_GPIO_BASE=1` (DI,
+  /PRDY, interrupt, DMA and STA DSB all live above `GP31`); no state machine's
+  contiguous pin span may cross the 16↔32 boundary (address + decode + DO fit
+  entirely in the low bank; DI0–DI7 sit entirely in the upper bank at base 32);
+  and the single-instruction autopush that captures the decode word reaches only
+  the low 32 GPIO — which is *why* DO (sampled) is placed low and DI (driven) is
+  placed high.
+
+The decode word is the S100 analog of the guide's `BusSignals` union (Ch. 8.3,
+9.1) — the union's bitfields **are** the GPIO map:
+
+```c
+// S100 decode word: one `in pins, 32` autopush from the LOW bank.
+// (DI0..DI7 on GP32..GP39 are DRIVEN by a separate SM, not part of this word.)
+typedef union {
+  struct {
+    uint32_t addr  : 16;   // A0..A15   GP0..GP15
+    uint32_t psync :  1;   // pSYNC     GP16
+    uint32_t dbin  :  1;   // pDBIN     GP17
+    uint32_t pwr   :  1;   // pWR*      GP18  (active low)
+    uint32_t sinp  :  1;   // sINP      GP19
+    uint32_t sout  :  1;   // sOUT      GP20
+    uint32_t smemr :  1;   // sMEMR     GP21
+    uint32_t resv  :  2;   //           GP22..GP23 (spare)
+    uint32_t dout  :  8;   // DO0..DO7  GP24..GP31 (host write data)
+  } __attribute__((packed));
+  uint32_t combined;
+} S100BusSignals;
+```
+
+Signal **polarity** is handled in the PIO exactly as the guide handles the MSX
+`/SLTSL` line (configured inverted, so `wait 1` means the line is low, Ch. 9): the
+S100 status lines are active-high and `pWR*` active-low, so each `wait` / `in` is
+set to the line's real sense (or inverted) in the state-machine config — a
+per-signal `.define`, not a wiring change. Final GPIO assignments are validated on
+the bench (roadmap step 0, [§15](#15-implementation-roadmap)) before the adapter
+PCB is committed.
+
+### 7.2 What the PIO layer must do
 
 It must:
 
@@ -764,7 +866,8 @@ Templates for the bus, device, and media classes are in
    rules: `PICO_PIO_USE_GPIO_BASE=1` for pins above 31, no state-machine pin span
    straddling the 16↔32 boundary, and single-instruction autopush capturing only
    the low 32 GPIO. Getting the GPIO grouping wrong forces a redesign late; settle
-   it before the adapter layout.
+   it before the adapter layout. A concrete starting assignment that satisfies all
+   three rules is proposed in [§7.1](#71-a-possible-gpio--s100-signal-map).
 
 ---
 
@@ -1169,6 +1272,7 @@ the text rather than inferred.
 | [NorthStar] | `North Star MDS Floppy Controllers.md` |
 | [88-DCDD] | `Altair Floppy (88-DCDD) Manual.md` |
 | [88-MDS] | `88-MDS Minidisk Manual.md` |
+| [Altair8800] | `Altair 8800 Theory of Operation.md` (880-110 bus pinout) |
 | [Tarbell] | `Tarbell_Floppy_Disk_Interface_Manual.md` |
 | [VersaFloppy] | `SD Systems VersaFloppy.md` |
 | [FDC+] | `FDC+ Manual.md` |
