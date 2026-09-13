@@ -308,7 +308,10 @@ per-bit pins are listed in bit order, not as a range:
 
 That is **44 assigned signals of the RP2350B's 48 GPIO** — S100 genuinely needs
 the high-pin-count part ([§3](#3-two-mcu-architecture)), and the map has almost no
-slack. Two consequences follow directly from the guide:
+slack. Call this **Option A (direct wiring)**: all 16 data lines are their own
+GPIO. A **secondary option that trades a transceiver for seven freed GPIO** is
+[below](#option-b--one-bidirectional-data-bus-via-a-transceiver). Two consequences
+follow directly from the guide:
 
 - **Transport should be USB-CDC, not UART, for the pin budget.** USB-CDC uses the
   RP2350's dedicated USB pins, leaving all 48 GPIO for the bus; a UART backend
@@ -353,6 +356,95 @@ set to the line's real sense (or inverted) in the state-machine config — a
 per-signal `.define`, not a wiring change. Final GPIO assignments are validated on
 the bench (roadmap step 0, [§15](#15-implementation-roadmap)) before the adapter
 PCB is committed.
+
+#### Option B — one bidirectional data bus via a transceiver
+
+Option A spends **16 GPIO** on data because the S100 bus keeps data-in and
+data-out physically separate. But the two buses are never active at once — a
+machine cycle is either a host *read* (the board drives DI) or a host *write* (the
+board samples DO), told apart by the latched status byte at pSYNC. So the board can
+present a **single 8-bit bidirectional data port** to the RP2350 and let a small
+amount of external glue steer it — collapsing 16 data GPIO to **8 data + 1
+direction = 9**, and freeing seven pins.
+
+**How.** Two 74LVC245-class transceivers (the same bus buffers an S100 board wants
+anyway for drive and loading on a long backplane — [§14 risk 3](#14-open-questions-and-risks)):
+one gates DO0–DO7 (host write data) onto the shared MCU `D0–D7`; the other gates
+the shared `D0–D7` out to DI0–DI7 (board read data). **One GPIO — `DBUF_DIR` —
+selects the direction:** on a host input cycle (sINP/sMEMR + pDBIN) it enables the
+`MCU→DI` transceiver and tri-states `DO→MCU`; on a host output cycle (sOUT + pWR*)
+it does the reverse. The two output-enables are complementary, so one direction
+bit drives both (one via an inverter), and the RP2350's own eight data-pin
+directions flip in lockstep (PIO `out pindirs` / a companion SM). The idle default
+is *sample / drive-disabled* so the board never fights the bus.
+
+This is a **guide-documented pattern used deliberately.** The Bring-Up Guide's
+ESP32 H89 example drives a `74LVC245` via `OE`/`DIR` pins (Ch. 1), and the CoCo
+PIO carries side-set `pindirs` machinery to flip a 245's direction (Ch. 9.3). The
+guide's *RP2350* worked examples drive the bus directly because their data buses
+are single or narrow; S100's split DI/DO is precisely the case where routing both
+through a 245 pays off.
+
+| S100 signal | S100 pin(s) | RP2350 GPIO | Bank | Dir | Role / note |
+|---|---|---|---|---|---|
+| A0–A15 | A0–A7: 79 80 81 31 30 29 82 83 · A8–A15: 84 34 37 87 33 85 86 32 | `GP0–GP15` | low | in | Address (unchanged from Option A). |
+| pSYNC | 76 | `GP16` | low | in | Cycle start (status latched at SYNC·Φ1). |
+| pDBIN | 78 | `GP17` | low | in | Read strobe. |
+| pWR* | 77 | `GP18` | low | in | Write strobe (active low). |
+| sINP | 46 | `GP19` | low | in | Status: I/O input. |
+| sOUT | 45 | `GP20` | low | in | Status: I/O output. |
+| sMEMR | 47 | `GP21` | low | in | Status: memory read. |
+| sWO* | 97 | `GP22` | low | in | Status: write/output cycle — now afforded (was a spare in A). |
+| **DBUF_DIR** | *(none — xcvr control)* | `GP23` | low | out | **The 1 direction GPIO.** Drives the data transceivers' DIR/OE from the decoded cycle type; set at pSYNC, stable through the pDBIN/pWR window. |
+| D0–D7 | write: DO 36 35 88 89 38 39 40 90 · read: DI 95 94 41 42 91 92 93 43 | `GP24–GP31` | low | in/out | **Single bidirectional data port.** Samples DO on host writes (in the decode word), drives DI on host reads, through the transceivers. Honor `bus_inverted` ([§8.1](#81-the-generic-wd179x--fd1771-core)). |
+| /PRDY | 72 | `GP32` | upper | out | Wait line (PRDY/WAIT-port models). |
+| XRDY | 3 | `GP33` | upper | out | Independent external-ready wait line — now afforded. |
+| PINT (/INT) | 73 | `GP34` | upper | out | Interrupt request (active low). |
+| PHOLD | 74 | `GP35` | upper | out | DMA bus-request (active low). |
+| PHLDA | 26 | `GP36` | upper | in | DMA bus-grant. |
+| STA DSB | 18 | `GP37` | upper | out | Status-disable for bus takeover ([§8.4](#84-boot-rom--prom-provisioning)). |
+| PRESET* | 75 | `GP38` | upper | in | Bus reset (active low) — now separate from POC. |
+| POC* | 99 | `GP39` | upper | in | Power-on clear (active low). |
+| Φ2 | 24 | `GP40` | upper | in | Bus clock / timing reference. |
+| VI0–VI7 *(or spares)* | 4 5 6 7 8 9 10 11 | `GP41–GP47` + 1 | upper | out | **Seven freed pins** — enough for the full vectored-interrupt set (VI7 needs the eighth; share a pin or drop one line), **or** a UART transport backend, **or** plain spares. |
+
+Now **≈41 GPIO carry the whole bus with room to spare** (vs 44/48 and no slack in
+Option A). The freed budget is the real prize: it lets the **UART transport**
+backend coexist without sacrificing a bus signal (relaxing Option A's USB-CDC-only
+constraint and [risk 7](#14-open-questions-and-risks)), or brings out all eight
+`VI0–VI7` lines. And because all data still lands in the **low bank**, the decode
+word is unchanged — the eight data bits are simply bidirectional, and `DBUF_DIR`
+takes the low-bank bit a spare held in Option A:
+
+```c
+// Option B decode word: still one `in pins, 32` autopush from the LOW bank.
+typedef union {
+  struct {
+    uint32_t addr     : 16;  // A0..A15    GP0..GP15
+    uint32_t psync    :  1;  // pSYNC      GP16
+    uint32_t dbin     :  1;  // pDBIN      GP17
+    uint32_t pwr      :  1;  // pWR*       GP18  (active low)
+    uint32_t sinp     :  1;  // sINP       GP19
+    uint32_t sout     :  1;  // sOUT       GP20
+    uint32_t smemr    :  1;  // sMEMR      GP21
+    uint32_t swo      :  1;  // sWO*       GP22
+    uint32_t dbuf_dir :  1;  // xcvr DIR   GP23 (output; readback for sanity)
+    uint32_t data     :  8;  // D0..D7     GP24..GP31 (DO on write / DI on read via xcvr)
+  } __attribute__((packed));
+  uint32_t combined;
+} S100BusSignals_B;
+```
+
+**The trade.** Option B adds two transceivers and one hard-real-time output
+(`DBUF_DIR`) whose direction-change timing carries the classic 245 contention
+hazard — mitigated because the cycle type is known at pSYNC, ahead of the data
+window, and because the idle default is safe. Option A needs no direction logic but
+runs the RP2350B's pin count to its limit. Which to build is a **bench decision**
+(roadmap step 0, [§15](#15-implementation-roadmap)): prototype Option A's direct
+wiring first if the pin budget holds for the chosen transport; adopt Option B when
+you want the UART backend, the full VI set, or simply margin — and note an S100
+board is already carrying bus transceivers, so Option B's marginal hardware cost is
+small.
 
 ### 7.2 What the PIO layer must do
 
