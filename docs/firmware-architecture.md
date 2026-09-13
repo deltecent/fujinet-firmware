@@ -148,20 +148,26 @@ pass-by-value of a live frame.
 4. On a good checksum, find the target device and hand it the frame:
 
    ```cpp
-   _activeDev = _daisyChain.deviceWithFujiID(tmpFrame.device());
-   if (_activeDev)
-       _activeDev->sio_process(tmpFrame);
+   for (auto devicep : _daisyChain)          // linear scan of the registry
+       if (tmpFrame.device() == devicep->_devnum)
+       {
+           _activeDev = devicep;
+           _activeDev->sio_process(tmpFrame);
+       }
    ```
 
-   Special cases handled here: the CONFIG **boot disk** (`_fujiDev->FUJI_BOOTDISK`,
-   with boot-priority logic that lets a real D1: take over), and **Type-3 polls**
-   (`FUJI_DEVICEID::TYPE3POLL`), which are broadcast to every device whose
-   `listen_to_type3_polls` flag is set.
+   Special cases handled here: the CONFIG **boot disk** (`_fujiDev->boot_config`
+   → `_fujiDev->bootdisk`, with boot-priority logic that lets a real D1: take
+   over), and **Type-3 polls** (`FUJI_DEVICEID_TYPE3POLL`), which are broadcast to
+   every device whose `listen_to_type3_polls` flag is set.
 
-The lookup uses the **`DaisyChain`** (`lib/bus/DaisyChain.h`), which owns the
-device registry: `addDevice()`, `deviceWithFujiID()`, `fujiIDForDevice()`,
-`rotateDevices()` (for disk rotation), and iteration (`begin()/end()`). It was
-introduced to centralize chain management across all buses.
+The registry is a plain **`std::forward_list<virtualDevice *> _daisyChain`**
+declared on the concrete bus (`sio.h`), **not** a dedicated class — there is no
+`DaisyChain` type and no `lib/bus/DaisyChain.h`. Devices are added with
+`addDevice()` (which sets `_devnum` and `push_front`s onto the list) and found by
+a linear scan; the helper `deviceById()` (`sio.cpp`) does the same match on
+`_devnum`. Disk-image rotation and the other chain edits (`remDevice`,
+`changeDeviceId`, `numDevices`, `shutdown`) all just walk this list.
 
 ### 2.4 The transaction contract (how a device replies)
 
@@ -209,12 +215,18 @@ different design:
 - **SLIP framing** (RFC 1055): the packet is delimited by `SLIP_END` (`0xC0`)
   bytes, with `0xDB` as an escape (`0xDB 0xDC` → literal `0xC0`, `0xDB 0xDD` →
   literal `0xDB`), so no payload byte can be mistaken for a frame boundary.
-- **A self-describing header** (`fujibus_header`, 6 bytes): `device`, `command`,
-  a `uint16 length` (total packet size — so the receiver knows how much to read),
-  `checksum` (over the whole decoded packet), and a `descr` descriptor byte.
+- **A self-describing header** (`fujibus_header`, 6 bytes, all multi-byte fields
+  little-endian): `device`, `command`, a `uint16 length` (total packet size incl.
+  header — so the receiver knows how much to read), a `checksum`, and a `descr`
+  descriptor byte. The checksum is an **8-bit add-with-carry-fold** over the whole
+  packet with the checksum byte zeroed (`chk += b; chk = (chk >> 8) + (chk & 0xFF)`)
+  — **not** a plain XOR.
 - **Typed, counted parameters**: descriptor bytes encode how many parameters
-  follow and their widths (1/2/4 bytes), chaining more descriptors while bit 7 is
-  set — replacing SIO's two fixed `aux` bytes.
+  follow and their widths — the code's lookup tables are
+  `numFieldsTable = {0,1,2,3,4,1,2,1}` and `fieldSizeTable = {0,1,1,1,1,2,2,4}`
+  (so a descriptor value of 5 = one `uint16`, 7 = one `uint32`, etc.), chaining
+  more descriptor bytes while bit 7 (`0x80`) is set — replacing SIO's two fixed
+  `aux` bytes.
 - **An arbitrary-length payload**: whatever remains after the params.
 
 Where it comes into play, contrasted with the SIO path:
@@ -228,8 +240,8 @@ Where it comes into play, contrasted with the SIO path:
 | Length known up front? | No (fixed size) | Yes (`length` field) |
 
 Everything *above* the framing is identical: the SLIP buses still derive from
-`SystemBusBase`, still look devices up through the `DaisyChain`, and still finish
-work through the same `transaction_accept/get/send/success/error` contract. Only
+`SystemBusBase`, still look devices up through their `_daisyChain` list, and still
+finish work through the same `transaction_accept/get/send/success/error` contract. Only
 the bytes on the wire and the per-command entry point differ.
 
 Two unrelated SLIP users exist for completeness and should not be confused with
@@ -282,17 +294,16 @@ serves a dozen machines.
 
 ### 3.1 `SystemBusBase` — the bus contract
 
-`SystemBusBase` (`lib/bus/bus.h`) is **bus-agnostic**. It owns the `DaisyChain`
-and defines the transaction contract as pure-virtual methods that every concrete
-bus must implement:
+`SystemBusBase` (`lib/bus/bus.h`) is **bus-agnostic**. It defines only the
+transaction contract (as pure-virtual methods every concrete bus implements) plus
+the text-encoding hooks; the device registry itself lives on each concrete bus,
+not here. The contract:
 
 ```cpp
 class SystemBusBase {
 protected:
     transState_t _transaction_state = TRANS_STATE::INVALID;
-    DaisyChain   _daisyChain;
 public:
-    virtual void addDevice(virtualDevice*, fujiDeviceID_t);   // default: DaisyChain
     virtual void transaction_accept(transState_t expectMoreData) = 0;
     virtual void transaction_success() = 0;
     virtual void transaction_error() = 0;
@@ -303,10 +314,11 @@ public:
 };
 ```
 
-`class systemBus : public SystemBusBase` (`sio.h:154`) then adds the SIO-specific
+`class systemBus : public SystemBusBase` (`sio.h`) then adds the SIO-specific
 machinery: baud-rate/high-speed handling, the `IOChannel* _port` (switchable
-between the real UART `_serial` and `NetSIO` for BusOverIP), the command pin,
-cached pointers to well-known devices (`_fujiDev`, `_modemDev`, `_netDev[8]`,
+between the real UART `_serial` and `NetSIO` for BusOverIP), the command pin, the
+device registry (`std::forward_list<virtualDevice*> _daisyChain`, with
+`addDevice()`/`deviceById()`), cached pointers to well-known devices (`_fujiDev`, `_modemDev`, `_netDev[8]`,
 `_cassetteDev`, `_cpmDev`, `_printerDev`), and the `service()` / `setup()` /
 `_sio_process_cmd()` loop described above.
 
@@ -418,10 +430,9 @@ then `transaction_get(buf, len)` to pull the host's sector, then
 
 For Atari that block registers the FujiNet, clock, MIDI/UDP stream, PCLink,
 printer(s), the R: modem/serial, voice, and CP/M devices. `systemBus::addDevice()`
-(`sio.cpp:551`) both caches the well-known devices into typed pointers
-(`_fujiDev`, `_modemDev`, `_netDev[]`, …) **and** forwards to
-`SystemBusBase::addDevice()`, which records them in the `DaisyChain` for lookup by
-ID.
+both caches the well-known devices into typed pointers (`_fujiDev`, `_modemDev`,
+`_netDev[]`, …) **and** sets the device's `_devnum` and `push_front`s it onto the
+bus's `_daisyChain` list for later lookup by ID.
 
 After setup, `fn_service_loop()` starts WiFi/BT, mounts disks, and enters the
 service loop.
@@ -441,7 +452,7 @@ in `lib/bus/bus.h`:
 | `iec/`               | `BUILD_IEC`   | Commodore IEC serial                       |
 | `drivewire/`         | `BUILD_COCO`  | TRS-80 CoCo (DriveWire)                    |
 | `comlynx/`           | `BUILD_LYNX`  | Atari Lynx (ComLynx)                       |
-| `rs232/`             | `BUILD_RS232` | Generic RS-232 (7-byte command frame)      |
+| `rs232/`             | `BUILD_RS232` | Generic RS-232 / **FujiBus** (FEP-004) — SLIP-framed `FujiBusPacket`, also carried over USB-CDC. *Not* a fixed command frame despite the `cmdFrame.h` 7-byte variant; see §2.5. |
 | `rc2014bus/`         | `BUILD_RC2014`| RC2014 retro bus                          |
 | `s100spi/`           | `BUILD_S100`  | S-100 (SPI)                               |
 | `cx16_i2c/`          | `BUILD_CX16`  | Commander X16 (I²C)                        |
@@ -507,7 +518,8 @@ Adding a new host bus is mostly about implementing the two contracts
 
 - **`service()`**: detect when the host wants attention (a pin, an incoming
   byte, an I²C address match…), read a command frame, look up the device with
-  `_daisyChain.deviceWithFujiID(id)`, and call its `sio_process(packet)`.
+  `deviceById(id)` (a linear scan of `_daisyChain`), and call its
+  `sio_process(packet)`.
 - **`transaction_*`**: translate the abstract accept/get/send/success/error steps
   into your wire protocol's ACK/data/status bytes. Use SIO's implementation
   (`lib/bus/sio/sio.cpp:104–182`) as the reference — it shows the exact
@@ -567,7 +579,7 @@ host asserts CMD line
        └─ _sio_process_cmd()                       sio.cpp:195
             ├─ _port->read(&frame, sizeof frame)   read 5-byte cmd frame
             ├─ sio_checksum(...) == frame.checksum? bad → toggle baud, retry
-            ├─ dev = _daisyChain.deviceWithFujiID(frame.device())
+            ├─ dev = deviceById(frame.device())    linear scan of _daisyChain
             └─ dev->sio_process(packet)            e.g. sioDisk  disk.cpp:323
                  ├─ transaction_accept(NO_GET|WILL_GET)   → ACK 'A'
                  ├─ [transaction_get(buf,len)]            → pull write payload
@@ -579,7 +591,9 @@ Key files:
 
 - `src/main.cpp` — global `SYSTEM_BUS`, `main_setup()`, `fn_service_loop()`.
 - `lib/bus/bus.h` — `SystemBusBase` contract + per-`BUILD_*` bus selection.
-- `lib/bus/DaisyChain.h` — device registry / lookup / rotation.
+- device registry: `std::forward_list<virtualDevice*> _daisyChain` on each
+  concrete bus (e.g. `sio.h`), added via `addDevice()` and searched via
+  `deviceById()` — there is no separate `DaisyChain` class.
 - `lib/bus/cmdFrame.h` — the command-frame struct.
 - `lib/bus/sio/sio.{h,cpp}` — the SIO `systemBus` and `virtualDevice`.
 - `lib/bus/sio/FujiSIOPacket.*` — command-frame wrapper.
@@ -602,7 +616,7 @@ are grouped by role; the three already covered in depth above — `bus/`,
 
 | Directory | Role |
 |---|---|
-| `bus/` | One `systemBus` per host family (`sio/`, `iwm/`, `adamnet/`, `iec/`, `drivewire/`, `comlynx/`, `rs232/`, `rc2014*`, `s100spi/`, `cx16_i2c/`, `h89/`, `mac/`), plus the shared `SystemBusBase` / `DaisyChain` / `cmdFrame.h` and the `Fuji*Packet` framing classes. See §2–§6. |
+| `bus/` | One `systemBus` per host family (`sio/`, `iwm/`, `adamnet/`, `iec/`, `drivewire/`, `comlynx/`, `rs232/`, `rc2014*`, `s100spi/`, `cx16_i2c/`, `h89/`, `mac/`), plus the shared `SystemBusBase` / `cmdFrame.h` and the `Fuji*Packet` framing classes. See §2–§6. |
 | `device/` | Device implementations, mirroring the same per-bus subdirs (`device/sio/…`) plus the cross-bus base selectors (`disk.h`, `printer.h`, `modem.h`, `network.h`, `cassette.h`) and `device/fujiDevice/` (the `theFuji` base + command mixins). |
 | `fuji/` | Support classes owned by the FUJINET device: `fujiHost` (a mount source — SD or a TNFS/HTTP host slot) and `fujiDisk` (a mounted disk-image slot). Distinct from `device/fujiDevice/`, which is the device itself. |
 
@@ -710,6 +724,18 @@ a different microcontroller with a different toolchain — the
 case PlatformIO), **not** PlatformIO/ESP-IDF and not the CMake PC build. `build.sh`
 never touches it; each subdirectory builds on its own into a `.uf2` you flash to
 a Pico in BOOTSEL mode.
+
+> **Related, but external.** The FujiNet *Platform Bring-Up Guide* (FEP-004)
+> centers on two repositories that are **not** in this tree: `fujiversal` — a
+> unified Pico-SDK RP2350 bus-interface firmware (per-board `.pio` files, ROM +
+> I/O-register emulation, a transparent FujiBus byte pipe to the ESP32 over
+> USB-CDC) — and `fujinet-bringup` — the minimal "byte relay + `iotest`" MVP used
+> to prove two-way host↔ESP32 communication before any board is built. The
+> `pico/*` projects above are the older, per-machine in-tree experiments;
+> `fujiversal` is the newer general pattern for the RP2350 front-end. On the ESP32
+> side, such a tandem front-end is consumed by the existing `rs232` (FujiBus) bus
+> class over USB-CDC — see §2.5 and §5 — so a tandem platform usually needs no new
+> ESP32 bus/device classes at all, only a build target and pin map.
 
 **Why a second MCU exists.** Some host computers talk to their peripherals over a
 *cartridge* or *disk* bus whose timing is far too tight to bit-bang from the

@@ -83,7 +83,7 @@ The FDC+ only covers the two Altair controllers. Our target set is wider (see
 ```
                      S100 backplane
   ┌───────────────┐  (I/O + DMA cycles) ┌──────────────────────┐  FujiBus/SLIP   ┌────────────────────────┐
-  │ S100 host CPU │◄───────────────────►│  RP2040/RP2350 (Pico) │◄───(USB-CDC or──►│  ESP32 fujinet-firmware │
+  │ S100 host CPU │◄───────────────────►│  RP2350B (Pico)       │◄───(USB-CDC or──►│  ESP32 fujinet-firmware │
   │ (8080/Z80/…)  │  ports, /PRDY, DMA, │  PIO bus emulation +  │    UART)         │  disk images, FS, WiFi, │
   └───────────────┘  VI/PINT interrupts │  FDC/UART cores       │                  │  config UI, N: network  │
                                         └──────────────────────┘                  └────────────────────────┘
@@ -91,7 +91,7 @@ The FDC+ only covers the two Altair controllers. Our target set is wider (see
 ```
 
 Exactly the split from firmware-architecture.md §9: an S100 I/O or DMA cycle must
-be answered in tens of nanoseconds, which only the RP2040/RP2350 **PIO** state
+be answered in tens of nanoseconds, which only the RP2350's **PIO** state
 machines can do. So responsibilities divide cleanly:
 
 | Concern | Where |
@@ -100,6 +100,19 @@ machines can do. So responsibilities divide cleanly:
 | Disk image storage & format decode, filesystems (SD/LittleFS/TNFS/host), WiFi, config, web UI, the personality library, the N: network stack | **ESP32** (existing FujiNet firmware) |
 
 The ESP32 keeps being a FujiNet. The Pico is a new, S100-shaped front-end for it.
+
+**Why the RP2350B specifically, not an RP2040.** The Platform Bring-Up Guide's
+interface-choice rule (FEP-004, Ch. 1) is "count your signal lines": a wide
+parallel bus needs the high-pin-count part. S100 is exactly that — a universal
+controller must see A0–A15 (16 lines, for North Star's memory-mapped registers and
+boot-ROM windows), the **separate** DI0–DI7 and DO0–DO7 data buses (16 more), plus
+`sINP`/`sOUT`/`pDBIN`/`pWR*`/`/PRDY`/status/VI interrupt/`PHOLD`/`PHLDA` control —
+comfortably 40+ GPIO. An RP2040 (~30 usable GPIO, 2 PIO blocks / 8 state machines)
+cannot fit that; the **RP2350B** (up to 48 GPIO, 3 PIO blocks / 12 state machines)
+is the intended part, and — per the guide — it also interfaces to 5 V bus levels
+directly (see [§14](#14-open-questions-and-risks) risk 3 for the backplane-drive
+caveat). Using GPIO above 31 imposes PIO constraints called out in
+[§7](#7-s100-bus-interface-layer-pio).
 
 ---
 
@@ -225,7 +238,23 @@ The descriptor wire format is in [§12](#12-personality-descriptor-wire-format).
 ## 7. S100 bus interface layer (PIO)
 
 This is the timing-critical heart and the most board-specific part. It lives in
-Pico PIO + tight core-1 code. It must:
+Pico PIO + tight core-1 code.
+
+> **RP2350 PIO GPIO-bank constraints (design-shaping, easy to miss).** Because the
+> S100 signal set spans more than 32 GPIO, three RP2350 rules from the Bring-Up
+> Guide (Ch. 9) drive the pin assignment and cannot be treated as afterthoughts:
+> (1) any routing that uses GPIO above 31 requires the firmware to be built with
+> `PICO_PIO_USE_GPIO_BASE=1` so the PIO can reach the upper bank; (2) a single
+> state machine's contiguous pin span **cannot straddle the GPIO 16↔32 boundary**,
+> so related signal groups (e.g. A0–A15, DI0–DI7, DO0–DO7) must each be placed
+> entirely within one bank; and (3) a PIO `in pins, 32` / autopush captures only
+> the **low 32 GPIO** in one instruction — so, unlike the guide's MSX/CoCo
+> examples (whose ≤32-signal buses fit one `BusSignals`-style word), the S100
+> decode must sample address, DI and DO across **multiple** PIO reads or state
+> machines rather than one packed word. Plan the GPIO map around these before
+> laying out the adapter. See also [§14](#14-open-questions-and-risks) risk 8.
+
+It must:
 
 **Decode a cycle.** On the Altair/S100 bus, an I/O cycle is signaled by the status
 byte (`sINP`/`sOUT`) with the port address on A0–A7; data travels on the bus's
@@ -384,11 +413,17 @@ differ per board [cited]:
 **How the board serves it.** The Pico emulates ROM as a memory device: it responds
 to **memory read cycles** in the personality's ROM window with bytes from a local
 copy of the ROM image, using the PIO+DMA ROM-emulation approach `pico/coco` already
-demonstrates (firmware-architecture.md §9). The ROM image itself is **fetched from
-the ESP32** at `APPLY` time (the ESP32's personality library holds the boot ROM
-blobs), by the same push mechanism `pico/intellivision` uses to receive a ROM over
-FujiBus — see the `ROM_FETCH` command in [§11](#11-fujibus-protocol-for-this-board)
-and the ROM fields in the [§12](#12-personality-descriptor-wire-format) descriptor.
+demonstrates (firmware-architecture.md §9). The closest live prior art for the
+*runtime-swappable* case is the `fujiversal` RP2350 firmware described in the
+Platform Bring-Up Guide (Ch. 8.4–8.5): it holds the ROM image in RP2350 RAM and
+serves bytes straight from a `rom_ptr` in its per-cycle PIO decode, and swaps the
+active image when the host writes an `IO_CONTROL` register (`rom_activate()`) — the
+activation trigger is a register write, not a packet. Our board does the same but
+picks the image per loaded personality. The ROM image itself is **fetched from the
+ESP32** at `APPLY` time (the ESP32's personality library holds the boot ROM blobs),
+by the same push mechanism `pico/intellivision` uses to receive a ROM over FujiBus
+— see the `ROM_FETCH` command in [§11](#11-fujibus-protocol-for-this-board) and the
+ROM fields in the [§12](#12-personality-descriptor-wire-format) descriptor.
 
 **Shadowing RAM (the Tarbell case).** When the ROM window overlaps RAM the guest
 also uses (Tarbell shadows 0000, then the loaded sector is written *into* RAM at
@@ -537,7 +572,7 @@ ESP32 side in `include/fujiDeviceID.h` / `include/fujiCommandID.h` and the new
 | `0x70` FUJINET | ESP32 control: mount/unmount/list, config-UI bridge (Pico→ESP32) |
 | `0x31…` DISK0.. | one per emulated drive (Pico→ESP32) |
 | `0x50…` SERIAL0.. | one per emulated serial channel (Pico→ESP32) |
-| `0xF0` PICO | the front-end itself, target of ESP32→Pico config pushes |
+| `0xFF` DBC | the front-end controller itself (the Pico), target of ESP32→Pico config pushes. This is the canonical `FUJI_DEVICEID_DBC` from `include/fujiDeviceID.h` ("bus controller itself"), reused here rather than inventing a new ID. |
 
 **Command IDs**
 
@@ -637,15 +672,31 @@ Notes:
 
 ## 13. ESP32 / FujiNet side
 
-New per-`BUILD_*` subsystem, following the exact patterns in
+**Why a new bus at all — and why S100 departs from the "reuse rs232" rule.** The
+Platform Bring-Up Guide's headline ESP32-side claim (FEP-004, Ch. 11–13) is that a
+tandem platform usually writes **no new bus or device classes**: the RP2350 is a
+*transparent* FujiBus byte pipe (the host itself speaks FujiBus through its ROM /
+client library), so the ESP32 just reuses the existing `rs232`/`BUILD_RS232` bus,
+adding only a build target and pin map. **S100 is the exception, and deliberately
+so.** Here the Pico is not a transparent pipe — it emulates a WD1793 (etc.) to the
+host and **translates** those register cycles into FujiBus requests it originates
+itself ([§4](#4-the-pico-is-the-fujibus-client)). That reversed request direction,
+the geometry-aware media (IMD / hard-sectored), and the personality-push control
+channel are what the stock `rs232` device set does not cover — which is exactly the
+guide's stated trigger for adding code ("only when your platform exposes a device
+the existing set does not, or a disk image format not already handled"). Where the
+transport itself is concerned we still reuse `FujiBusPacket` framing over an
+`IOChannel`, unchanged. New per-`BUILD_*` subsystem, following the patterns in
 firmware-architecture.md §3–§6, §8:
 
 - **`lib/bus/s100/`** — a `systemBus : public SystemBusBase` whose transport is an
   `IOChannel` (USB-CDC `ACMChannel` or `UARTChannel`, per firmware-architecture.md
   §8 `hardware/`) carrying **FujiBus packets** (reuse `FujiBusPacket` framing). Its
-  `service()` reads a SLIP frame, looks the device up in the `DaisyChain`, and
+  `service()` reads a SLIP frame, looks the device up in the bus's
+  `std::forward_list<virtualDevice*> _daisyChain` (via `deviceById()`, per
+  firmware-architecture.md §3 — there is no separate `DaisyChain` class), and
   dispatches. Because the Pico is the client, this bus mostly **answers** requests
-  and occasionally **pushes** config frames to device `0xF0`.
+  and occasionally **pushes** config frames to device `0xFF` (DBC).
 - **`lib/device/s100/`** — `s100Disk : virtualDevice` (holds a `MediaType *`,
   answers the `DISK_*` commands), `s100Serial`/reuse of the shared `modem`/
   `network` bases (answers `UART_*`), and an `s100Fuji` control device for
@@ -677,9 +728,19 @@ Templates for the bus, device, and media classes are in
    backplane-timing-sensitive PIO effort. Candidate for a **later phase**; ship
    PIO/wait-state boards first.
 3. **Data-bus polarity & backplane electricals.** FD1771/179x inverted DAL
-   [Tarbell][VersaFloppy], the Altair/S100 **separate data-in / data-out** buses,
-   and 5 V bus levels vs 3.3 V Pico all need level-shifting/transceiver design in
-   the hardware (out of scope for this software design, but gating).
+   [Tarbell][VersaFloppy] and the Altair/S100 **separate data-in / data-out** buses
+   both need attention in hardware. On voltage, distinguish two things the Platform
+   Bring-Up Guide (Ch. 1, Ch. 7) is careful to separate: the **RP2350 is 5 V
+   tolerant and can connect to 5 V bus levels directly** — level-shifting purely for
+   *protection* is not required and is called out in that guide as a common mistake.
+   What an S100 board *does* still need is **bus drive and signal integrity on a
+   long, heavily-loaded backplane** (many card slots, high capacitance, the separate
+   DI/DO buses) — i.e. proper S100 bus transceivers/buffers, which the guide agrees
+   are warranted "on a long or heavily-loaded bus." So: transceivers for drive and
+   loading, **not** level-shifters for protection. (Verify the RP2350 5 V-tolerance
+   claim against the current RP2350 datasheet/errata before committing the design;
+   the guide notes it reversed position on this point across revisions.) All of this
+   is out of scope for the software design but gating for the board.
 4. **Manual gaps we must resolve on hardware, not guess** (from the extraction):
    - FDC+ does **not** document its serial wire protocol or reprint register bit
      fields (defers to 88-DCDD/88-MDS) [FDC+] — we define our own protocol anyway.
@@ -698,11 +759,32 @@ Templates for the bus, device, and media classes are in
 7. **Which link to ship first** — USB-CDC (RP2350 device / ESP32-S3 host, like
    `pico/intellivision`) is the recommended default for throughput; a UART backend
    is the fallback. Design the transport as an abstraction with both.
+8. **RP2350 PIO GPIO-bank layout** ([§7](#7-s100-bus-interface-layer-pio)). The
+   S100 signal set exceeds 32 GPIO, so the pin map is constrained by three RP2350
+   rules: `PICO_PIO_USE_GPIO_BASE=1` for pins above 31, no state-machine pin span
+   straddling the 16↔32 boundary, and single-instruction autopush capturing only
+   the low 32 GPIO. Getting the GPIO grouping wrong forces a redesign late; settle
+   it before the adapter layout.
 
 ---
 
 ## 15. Implementation roadmap
 
+Order the work as a **milestone ladder** in the sense of the Platform Bring-Up
+Guide (FEP-004, Ch. 10, Ch. 17): each rung is independently testable and a failure
+is contained to the rung you are on. Crucially, the guide's discipline is to prove
+the **byte pipe and a real FujiBus round-trip on the bench — over USB, with no S100
+card in existence yet — before fabricating hardware**, following the `fujinet-bringup`
+MVP (a minimal byte relay + `iotest` loopback). That directly de-risks this design's
+#1 unknown (round-trip latency, [§14](#14-open-questions-and-risks) risk 1), so step
+0 below exists before any board is built:
+
+0. **Bench loopback + FujiBus ACK (no S100 card).** Wire the RP2350 to the ESP32
+   over USB-CDC. Prove a byte injected on one side reaches the other (loopback),
+   then that a real `FujiBusPacket` request from the Pico gets an `ACK` (+data)
+   reply from an ESP32 `s100` device stub. **Measure the round-trip time here** — it
+   sets the sector-cache read-ahead depth ([§4.1](#41-latency-and-the-sector-cache))
+   and decides USB-CDC vs UART before the adapter is laid out.
 1. **Codec + skeletons.** FujiBus client on the Pico (port of
    `FujiBusPacket.cpp`, desktop self-test); `s100` bus/device/media skeletons on
    the ESP32; personality descriptor + `LOAD_PERSONALITY`/`APPLY` handshake.
@@ -730,6 +812,17 @@ Templates for the bus, device, and media classes are in
 > other `pico/*` projects (see firmware-architecture.md §9). `// TODO` marks the
 > backplane-timing- and personality-specific parts that must be filled in and
 > validated on hardware.
+>
+> **Relationship to `fujiversal`.** The Platform Bring-Up Guide's general RP2350
+> pattern is `fujiversal` — a single Pico-SDK firmware that emulates ROM + I/O
+> registers and acts as a *transparent* FujiBus byte pipe, selected per board by a
+> `.pio` file. This S100 front-end deliberately is **not** that: it is a translating
+> FDC/UART emulator with a sector cache, multiple flow-control PIO programs, and its
+> own FujiBus *client* logic ([§4](#4-the-pico-is-the-fujibus-client),
+> [§13](#13-esp32--fujinet-side)), so it is scaffolded as a standalone pico project
+> rather than a `fujiversal` board. It still reuses `fujiversal`'s ROM-emulation
+> idea ([§8.4](#84-boot-rom--prom-provisioning)) and the FujiBus wire format. The
+> bench bring-up (roadmap step 0) follows the `fujinet-bringup` loopback method.
 
 ### A.1 `fujibus.h` — FujiBus/SLIP client (Pico is the client)
 
@@ -749,9 +842,13 @@ enum { SLIP_END=0xC0, SLIP_ESCAPE=0xDB, SLIP_ESC_END=0xDC, SLIP_ESC_ESC=0xDD };
 #define S100_DEVICEID_FUJINET 0x70   // ESP32 control (mount/list/config bridge)
 #define S100_DEVICEID_DISK0   0x31   // DISK0..DISK0+n
 #define S100_DEVICEID_SERIAL0 0x50   // SERIAL0..+n
-#define S100_DEVICEID_PICO    0xF0   // ESP32 -> Pico config pushes land here
+#define S100_DEVICEID_PICO    0xFF   // == FUJI_DEVICEID_DBC (bus controller itself);
+                                     // ESP32 -> Pico config pushes land here
 
-// Command IDs
+// Command IDs.
+// NOTE: ACK/NAK are REPLY command bytes (== FUJICMD_ACK/FUJICMD_NAK in
+// include/fujiCommandID.h). Because a FujiBus reply reuses the `command` field
+// for ACK/NAK, no REQUEST command below may reuse 0x06 or 0x15.
 #define S100_ACK 0x06
 #define S100_NAK 0x15
 #define S100_CMD_HELLO            0x01
@@ -765,7 +862,7 @@ enum { SLIP_END=0xC0, SLIP_ESCAPE=0xDB, SLIP_ESC_END=0xDC, SLIP_ESC_ESC=0xDD };
 #define S100_CMD_DISK_WRITE_SECTOR 0x12
 #define S100_CMD_DISK_READ_TRACK  0x13
 #define S100_CMD_DISK_WRITE_TRACK 0x14
-#define S100_CMD_DISK_READ_ADDRESS 0x15
+#define S100_CMD_DISK_READ_ADDRESS 0x16   // NOT 0x15 -- that value is NAK (see above)
 #define S100_CMD_UART_CONFIG      0x20
 #define S100_CMD_UART_TX          0x21
 #define S100_CMD_UART_RX_POLL     0x22
@@ -947,7 +1044,7 @@ uint8_t uart_status_byte(uart_core*);   // assembles status using smap (board-de
 ```cpp
 #ifndef S100_H
 #define S100_H
-#include "bus.h"              // SystemBusBase, DaisyChain
+#include "bus.h"              // SystemBusBase (registry is a per-bus _daisyChain list)
 #include "FujiBusPacket.h"    // reuse the RS232/FujiBus SLIP framing
 #include "IOChannel.h"        // ACMChannel (USB-CDC) or UARTChannel
 
@@ -967,7 +1064,7 @@ public:
     void addDevice(virtualDevice *pDevice, fujiDeviceID_t device_id) override;
 
     // Here the Pico is the CLIENT: we mostly answer its requests, and PUSH config.
-    void pushPersonality(const uint8_t *descriptor, size_t len);  // -> device 0xF0
+    void pushPersonality(const uint8_t *descriptor, size_t len);  // -> device 0xFF (DBC)
 
     // Transaction contract (SystemBusBase). Replies via FujiBus ACK/NAK(+data),
     // exactly like rs232.cpp's sendReplyPacket().
